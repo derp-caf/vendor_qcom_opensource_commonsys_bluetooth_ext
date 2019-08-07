@@ -1074,17 +1074,19 @@ public final class Avrcp_ext {
                 Bundle data = msg.getData();
                 byte[] bdaddr = data.getByteArray("BdAddress");
                 String address = Utils.getAddressStringFromByte(bdaddr);
-                BluetoothDevice device;
+                BluetoothDevice device, activeDevice = null;
                 Log.v(TAG, "event for device address " + address);
                 deviceIndex = getIndexForDevice(mAdapter.getRemoteDevice(address));
                 if (deviceIndex == INVALID_DEVICE_INDEX) {
                     Log.e(TAG,"invalid index for device");
                     break;
                 }
+                activeDevice = mA2dpService.getActiveDevice();
                 byte absVol = (byte) ((byte) msg.arg1 & 0x7f); // discard MSB as it is RFD
                 if (DEBUG) Log.v(TAG, "MSG_NATIVE_REQ_VOLUME_CHANGE addr: " + address);
 
-                if (((!(deviceFeatures[deviceIndex].isActiveDevice)) &&
+                if (((!(activeDevice != null
+                    && Objects.equals(deviceFeatures[deviceIndex].mCurrentDevice, activeDevice))) &&
                     (deviceFeatures[deviceIndex].mInitialRemoteVolume != -1)) ||
                     (!deviceFeatures[deviceIndex].isAbsoluteVolumeSupportingDevice)) {
                         if (deviceFeatures[deviceIndex].isAbsoluteVolumeSupportingDevice) {
@@ -1166,8 +1168,9 @@ public final class Avrcp_ext {
                     deviceFeatures[deviceIndex].mInitialRemoteVolume = absVol;
                     //Avoid fluctuation of volume during device add in blacklist
                     // use send setAbsolute volume for blacklisted volume
-                    if(deviceFeatures[deviceIndex].mBlackListVolume != -1 &&
-                       deviceFeatures[deviceIndex].isActiveDevice) {
+                    if (deviceFeatures[deviceIndex].mBlackListVolume != -1 &&
+                       activeDevice != null &&
+                       Objects.equals(activeDevice, deviceFeatures[deviceIndex].mCurrentDevice)) {
                         resetBlackList(address);
                         if (DEBUG) Log.v(TAG, "remote initial volume as audio stream volume : " +
                             deviceFeatures[deviceIndex].mBlackListVolume);
@@ -1179,7 +1182,8 @@ public final class Avrcp_ext {
                         deviceFeatures[deviceIndex].mLocalVolume = deviceFeatures[deviceIndex].mBlackListVolume;
                         deviceFeatures[deviceIndex].mBlackListVolume = -1;
                         break;
-                    } else if (deviceFeatures[deviceIndex].isActiveDevice) {
+                    } else if (activeDevice != null &&
+                          Objects.equals(activeDevice, deviceFeatures[deviceIndex].mCurrentDevice)) {
                         /*Avoid send set absolute volume for store volume untill volume registration
                         complete and making synchronization to send only one setAbsolute volume
                         during connection*/
@@ -1215,7 +1219,8 @@ public final class Avrcp_ext {
                     }
                     device = mA2dpService.getActiveDevice();
                     /* If the volume has successfully changed */
-                    if (device != null && !deviceFeatures[deviceIndex].isActiveDevice &&
+                    if (device != null && !(activeDevice != null &&
+                           Objects.equals(activeDevice, deviceFeatures[deviceIndex].mCurrentDevice)) &&
                            (msg.arg2 == AVRC_RSP_CHANGED || msg.arg2 == AVRC_RSP_INTERIM)) {
                         Log.d(TAG, "Do not change volume from an inactive device");
                         break;
@@ -1275,10 +1280,12 @@ public final class Avrcp_ext {
                 if (DEBUG) Log.v(TAG, "MSG_SET_ABSOLUTE_VOLUME");
 
                 int avrcpVolume = convertToAvrcpVolume(msg.arg1);
+                BluetoothDevice activeDevice = mA2dpService.getActiveDevice();
                 avrcpVolume = Math.min(AVRCP_MAX_VOL, Math.max(0, avrcpVolume));
                 for (int i = 0; i < maxAvrcpConnections; i++) {
-                    if (deviceFeatures[i].mCurrentDevice != null &&
-                            deviceFeatures[i].isActiveDevice && deviceFeatures[i].isAbsoluteVolumeSupportingDevice) {
+                    if (deviceFeatures[i].mCurrentDevice != null && activeDevice != null &&
+                            Objects.equals(activeDevice, deviceFeatures[i].mCurrentDevice) &&
+                            deviceFeatures[i].isAbsoluteVolumeSupportingDevice) {
 
                           deviceIndex = i;
 
@@ -2677,9 +2684,10 @@ public final class Avrcp_ext {
             return false;
       }*/
         boolean status = false;
+        BluetoothDevice activeDevice = mA2dpService.getActiveDevice();
         for (int i = 0; i < maxAvrcpConnections; i++) {
-            if (deviceFeatures[i].mCurrentDevice != null &&
-                    deviceFeatures[i].isActiveDevice) {
+            if (deviceFeatures[i].mCurrentDevice != null && activeDevice != null &&
+                    Objects.equals(deviceFeatures[i].mCurrentDevice, activeDevice)) {
                 if ((deviceFeatures[i].mFeatures &
                         BTRC_FEAT_ABSOLUTE_VOLUME) != 0) {
                     status = true;
