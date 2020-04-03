@@ -60,10 +60,6 @@
 
 #if (TWS_AG_ENABLED == TRUE)
 
-#ifndef BTA_AG_SCO_DEBUG
-#define BTA_AG_SCO_DEBUG FALSE
-#endif
-
 void send_twsp_esco_setup (const RawAddress& left_eb_addr, const RawAddress& rght_eb_addr,
     uint8_t selected_mic);
 void print_bdaddr(const RawAddress& addr);
@@ -198,13 +194,11 @@ void bta_ag_twsp_sco_event(tBTA_AG_SCB* p_scb, uint8_t event) {
    //PONTING TO SECONDARY sco cb
    tBTA_AG_SCO_CB* p_sco = &bta_ag_cb.twsp_sec_sco;
    tBTA_AG_SCB *other_scb = NULL;
-#if (BTA_AG_SCO_DEBUG == TRUE)
    uint8_t in_state = p_sco->state;
-#endif
-   APPL_TRACE_EVENT("%s: SCO Index 0x%04x, State %d, Event %d", __func__,
+   APPL_TRACE_IMP("%s: SCO Index 0x%04x, State %d, Event %d", __func__,
                      p_scb->sco_idx, p_sco->state, event);
 
-   APPL_TRACE_EVENT("%s: TWS+ peer p_scb: %x", __func__, p_scb);
+   APPL_TRACE_IMP("%s: TWS+ peer p_scb: %x", __func__, p_scb);
 
    switch (p_sco->state) {
        case BTA_AG_SCO_SHUTDOWN_ST:
@@ -270,8 +264,13 @@ void bta_ag_twsp_sco_event(tBTA_AG_SCB* p_scb, uint8_t event) {
                     twsp_select_microphone(get_other_twsp_scb(p_scb->peer_addr), p_scb);
                 }
                 /* create sco connection to peer */
-                bta_ag_create_sco(p_scb, true);
-                p_sco->state = BTA_AG_SCO_OPENING_ST;
+                if (bta_ag_create_sco(p_scb, true)) {
+                    p_sco->state = BTA_AG_SCO_OPENING_ST;
+                } else {
+                    APPL_TRACE_WARNING("%s: create sco connection failed", __func__);
+                    p_sco->state = BTA_AG_SCO_LISTEN_ST;
+                    bta_ag_cback_sco(p_scb, BTA_AG_AUDIO_CLOSE_EVT);
+                }
             break;
             case BTA_AG_SCO_CONN_CLOSE_E:
                 //SCO failed back to LISTEN
@@ -488,14 +487,12 @@ void bta_ag_twsp_sco_event(tBTA_AG_SCB* p_scb, uint8_t event) {
     default:
       break;
   }
-#if (BTA_AG_SCO_DEBUG == TRUE)
   if (p_sco->state != in_state) {
-    APPL_TRACE_EVENT("BTA AG TWS SCO State Change: [%s] -> [%s] after Event [%s]",
+    APPL_TRACE_IMP("BTA AG TWS SCO State Change: [%s] -> [%s] after Event [%s]",
                      bta_ag_sco_state_str(in_state),
                      bta_ag_sco_state_str(p_sco->state),
                      bta_ag_sco_evt_str(event));
   }
-#endif
 }
 
 void print_bdaddr(const RawAddress& addr) {

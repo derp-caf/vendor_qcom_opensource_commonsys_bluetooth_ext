@@ -142,7 +142,6 @@ public final class Avrcp_ext {
     /* Local volume in audio index 0-15 */
     private int mLocalVolume;
     private int mLastLocalVolume;
-    private int mAbsVolThreshold;
 
     private boolean mFastforward;
     private boolean mRewind;
@@ -183,11 +182,14 @@ public final class Avrcp_ext {
                         (byte)0xCE, (byte)0xFA, (byte)0xCE};
     private static final String playerStateUpdateBlackListedAddr[] = {
          "BC:30:7E", //bc-30-7e-5e-f6-27, Name: Porsche BT 0310; bc-30-7e-8c-22-cb, Name: Audi MMI 1193
+         "2C:DC:AD", //2C-DC-AD-BB-2F-25, Name: PORSCHE
          "00:1E:43", //00-1e-43-14-f0-68, Name: Audi MMI 4365
          "9C:DF:03", //9C:DF:03:D3:C0:17, Name: Benz S600L
          "00:0A:08",  //00:0A:08:51:1E:E7, Name: BMW530
          "00:04:79", //00-04-79-00-06-bc, Name: radius HP-BTL01
          "28:A1:83", //28-A1-83-94-90-AE, Name: VW Radio
+         "30:c3:d9", //30-c3-d9-8d-5b-83, Name: VW RadioBin
+         "24:df:6a", //24-df-6a-f4-0a-7e, Name: HUAWEI WATCH
      };
     private static final String playerStateUpdateBlackListedNames[] = {
        "Audi",
@@ -197,7 +199,9 @@ public final class Avrcp_ext {
 
     private static final ArrayList<String> playerBrowseWhiteListDB =
        new ArrayList<String>(Arrays.asList(
-               "com.google.android.music"
+               "com.google.android.music",
+               "com.nhn.android.music",
+               "com.gaana"
     ));
 
     private static final String nonMediaAppsBlacklistedNames[] = {
@@ -256,8 +260,6 @@ public final class Avrcp_ext {
     private final static int MESSAGE_START_SHO = 34;
     private static final int MSG_SET_ACTIVE_DEVICE = 35;
 
-    private static final int STACK_CLEANUP = 0;
-    private static final int APP_CLEANUP = 1;
     private static final int CMD_TIMEOUT_DELAY = 2000;
     private static final int MAX_ERROR_RETRY_TIMES = 6;
     private static final int AVRCP_MAX_VOL = 127;
@@ -276,7 +278,6 @@ public final class Avrcp_ext {
     private SortedMap<Integer, MediaPlayerInfo_ext> mMediaPlayerInfoList;
     private boolean mAvailablePlayerViewChanged;
 
-    private boolean mPlayerSwitching;
     private List<String> mPkgRequestedMBSConnect;
 
     /* List of media players which supports browse */
@@ -294,6 +295,7 @@ public final class Avrcp_ext {
     /* Broadcast receiver for device connections intent broadcasts */
     private final BroadcastReceiver mAvrcpReceiver = new AvrcpServiceBroadcastReceiver();
     private final BroadcastReceiver mBootReceiver = new AvrcpServiceBootReceiver();
+    private final BroadcastReceiver mShutDownReceiver = new AvrcpServiceShutDownReceiver();
 
     /* Recording passthrough key dispatches */
     static private final int PASSTHROUGH_LOG_MAX_SIZE = DEBUG ? 50 : 10;
@@ -474,7 +476,6 @@ public final class Avrcp_ext {
         mLastDirection = 0;
         mLocalVolume = -1;
         mLastLocalVolume = -1;
-        mAbsVolThreshold = 0;
         mCurrAddrPlayerID = NO_PLAYER_ID;
         mCurrBrowsePlayerID = 0;
         mContext = context;
@@ -504,18 +505,6 @@ public final class Avrcp_ext {
         mAudioStreamMax = mAudioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
         mVolumeStep = Math.max(AVRCP_BASE_VOLUME_STEP, AVRCP_MAX_VOL/mAudioStreamMax);
 
-        Resources resources = context.getResources();
-        if (resources != null) {
-            mAbsVolThreshold = resources.getInteger(R.integer.a2dp_absolute_volume_initial_threshold);
-
-            // Update the threshold if the threshold_percent is valid
-            int threshold_percent =
-                    resources.getInteger(R.integer.a2dp_absolute_volume_initial_threshold_percent);
-            if (threshold_percent >= 0 && threshold_percent <= 100) {
-                mAbsVolThreshold = (threshold_percent * mAudioStreamMax) / 100;
-            }
-        }
-
         // Register for package removal intent broadcasts for media button receiver persistence
         IntentFilter pkgFilter = new IntentFilter();
         pkgFilter.addAction(Intent.ACTION_PACKAGE_REMOVED);
@@ -530,6 +519,10 @@ public final class Avrcp_ext {
         context.registerReceiver(mBootReceiver, bootFilter);
         pts_test = SystemProperties.getBoolean("vendor.bluetooth.avrcpct-passthrough.pts", false);
         avrcp_playstatus_blacklist = SystemProperties.getBoolean("persist.vendor.btstack.avrcp-playstatus.blacklist", false);
+
+        IntentFilter shutdownFilter = new IntentFilter();
+        shutdownFilter.addAction(Intent.ACTION_SHUTDOWN);
+        context.registerReceiver(mShutDownReceiver, shutdownFilter);
 
         // create Notification channel.
         mNotificationManager = (NotificationManager)
@@ -564,7 +557,6 @@ public final class Avrcp_ext {
         mAvrcpPlayerAppSettingsRsp = new AvrcpPlayerAppSettingsRsp();
         mMediaPlayerInfoList = new TreeMap<Integer, MediaPlayerInfo_ext>();
         mAvailablePlayerViewChanged = false;
-        mPlayerSwitching = false;
         mPkgRequestedMBSConnect = new ArrayList<String>();
         mBrowsePlayerInfoList = Collections.synchronizedList(new ArrayList<BrowsePlayerInfo_ext>());
         mPassthroughDispatched = 0;
@@ -615,6 +607,11 @@ public final class Avrcp_ext {
 
         initMediaPlayersList();
 
+        BrowsedMediaPlayer_ext player =
+                mAvrcpBrowseManager.getBrowsedMediaPlayer(dummyaddr);
+        if (player != null)
+            player.start();
+
         UserManager manager = UserManager.get(mContext);
         if (manager == null || manager.isUserUnlocked()) {
             if (DEBUG) Log.d(TAG, "User already unlocked, initializing player lists");
@@ -657,7 +654,7 @@ public final class Avrcp_ext {
             mAudioManager.unregisterAudioPlaybackCallback(mAudioManagerPlaybackCb);
 
         if (mMediaController != null) mMediaController.unregisterCallback(mMediaControllerCb);
-        Message msg = mHandler.obtainMessage(MESSAGE_DEVICE_RC_CLEANUP, APP_CLEANUP,
+        Message msg = mHandler.obtainMessage(MESSAGE_DEVICE_RC_CLEANUP, 0,
                0, null);
         mHandler.sendMessage(msg);
         if (mMediaSessionManager != null) {
@@ -685,6 +682,7 @@ public final class Avrcp_ext {
         mAudioManagerPlaybackHandler = null;
         mContext.unregisterReceiver(mAvrcpReceiver);
         mContext.unregisterReceiver(mBootReceiver);
+        mContext.unregisterReceiver(mShutDownReceiver);
 
         mPkgRequestedMBSConnect.clear();
         mAddressedMediaPlayer.cleanup();
@@ -866,15 +864,9 @@ public final class Avrcp_ext {
                 deviceIndex = msg.arg1;
                 int vol = msg.arg2;
                 BluetoothDevice device = mA2dpService.getActiveDevice();
-                if(device == null)
+                if (device == null)
                     break;
-                if (mAbsVolThreshold > 0 && mAbsVolThreshold < mAudioStreamMax &&
-                    vol > mAbsVolThreshold) {
-                    if (DEBUG) Log.v(TAG, "remote inital volume too high " + vol + ">" +
-                       mAbsVolThreshold);
-                    vol = mAbsVolThreshold;
-                    notifyVolumeChanged(vol, false);
-                }
+
                 if (vol >= 0) {
                     int volume = convertToAvrcpVolume(vol);
                     int remVol = deviceFeatures[deviceIndex].mRemoteVolume;
@@ -1345,11 +1337,6 @@ public final class Avrcp_ext {
                      * retry a volume one step up/down */
                     if (DEBUG) Log.d(TAG, "Remote device didn't tune volume, let's try one more step.");
                     /* direction calculation for retry mechanism */
-                    if(convertToAudioStreamVolume(deviceFeatures[deviceIndex].mLastRemoteVolume)
-                        < deviceFeatures[deviceIndex].mLocalVolume)
-                        deviceFeatures[deviceIndex].mLastDirection = -1;
-                    else
-                        deviceFeatures[deviceIndex].mLastDirection = 1;
                     int retry_volume = Math.min(AVRCP_MAX_VOL,
                             Math.max(0, deviceFeatures[deviceIndex].mLastRemoteVolume +
                                         deviceFeatures[deviceIndex].mLastDirection));
@@ -1360,7 +1347,6 @@ public final class Avrcp_ext {
                             0, 0, deviceFeatures[deviceIndex].mCurrentDevice), CMD_TIMEOUT_DELAY);
                         deviceFeatures[deviceIndex].mVolCmdAdjustInProgress = true;
                     }
-                    deviceFeatures[deviceIndex].mLastDirection = 0;
                 } else if (msg.arg2 == AVRC_RSP_REJ) {
                     if (DEBUG)
                         Log.v(TAG, "setAbsoluteVolume call rejected");
@@ -1410,6 +1396,10 @@ public final class Avrcp_ext {
                                    CMD_TIMEOUT_DELAY);
                               deviceFeatures[deviceIndex].mVolCmdSetInProgress = true;
                               deviceFeatures[deviceIndex].mLastRemoteVolume = avrcpVolume;
+                              if(deviceFeatures[deviceIndex].mLastLocalVolume >  msg.arg1)
+                                  deviceFeatures[deviceIndex].mLastDirection = -1;
+                              else
+                                  deviceFeatures[deviceIndex].mLastDirection = 1;
                               deviceFeatures[deviceIndex].mLastLocalVolume = msg.arg1;
                               deviceFeatures[deviceIndex].mLastRequestedVolume = -1;
                          } else {
@@ -1455,18 +1445,6 @@ public final class Avrcp_ext {
                 mA2dpState = msg.arg1;
                 BluetoothDevice playStateChangeDevice = (BluetoothDevice)msg.obj;
                 Log.v(TAG, "event for device address " + playStateChangeDevice.getAddress());
-                deviceIndex = getIndexForDevice(playStateChangeDevice);
-                if (deviceIndex == INVALID_DEVICE_INDEX) {
-                    Log.e(TAG,"Set A2DP state: invalid index for device");
-                    break;
-                }
-                // if BA streaming is ongoing, don't update AVRCP state based on A2DP State.
-                // This is for some remote devices, which send PLAY/PAUSE based on AVRCP State.
-                BATService mBatService = BATService.getBATService();
-                if ((mBatService == null) || !mBatService.isA2dpSuspendFromBA()) {
-                  // if this suspend was triggered by BA, then don't update AVRCP states
-                  updateCurrentMediaState((BluetoothDevice)msg.obj);
-                }
 
                 if (mA2dpState == BluetoothA2dp.STATE_PLAYING) {
                     boolean shoComplete = false;
@@ -1486,32 +1464,30 @@ public final class Avrcp_ext {
                         CompleteSHO();
                     }
                 }
+
+                deviceIndex = getIndexForDevice(playStateChangeDevice);
+                if (deviceIndex == INVALID_DEVICE_INDEX) {
+                    Log.e(TAG,"Set A2DP state: invalid index for device");
+                    break;
+                }
+                // if BA streaming is ongoing, don't update AVRCP state based on A2DP State.
+                // This is for some remote devices, which send PLAY/PAUSE based on AVRCP State.
+                BATService mBatService = BATService.getBATService();
+                if ((mBatService == null) || !mBatService.isA2dpSuspendFromBA()) {
+                  // if this suspend was triggered by BA, then don't update AVRCP states
+                  updateCurrentMediaState((BluetoothDevice)msg.obj);
+                }
+
               }
               break;
 
             case MESSAGE_DEVICE_RC_CLEANUP:
                 if (DEBUG)
-                    Log.v(TAG,"MESSAGE_DEVICE_RC_CLEANUP: " + msg.arg1);
-                if (msg.arg1 == STACK_CLEANUP) {
-                    deviceIndex = getIndexForDevice((BluetoothDevice) msg.obj);
-                    if (deviceIndex == INVALID_DEVICE_INDEX) {
-                        Log.e(TAG,"invalid device index for cleanup");
-                        break;
+                    Log.v(TAG, "MESSAGE_DEVICE_RC_CLEANUP");
+                    clearDeviceDependentFeature();
+                    for (int i = 0; i < maxAvrcpConnections; i++) {
+                       cleanupDeviceFeaturesIndex(i);
                     }
-                    cleanupDeviceFeaturesIndex(deviceIndex);
-                } else if (msg.arg1 == APP_CLEANUP) {
-                    if (msg.obj == null) {
-                        clearDeviceDependentFeature();
-                        for (int i = 0; i < maxAvrcpConnections; i++) {
-                            cleanupDeviceFeaturesIndex(i);
-                        }
-                    } else {
-                        Log.v(TAG, "Invalid message params");
-                        break;
-                    }
-                } else {
-                    Log.v(TAG, "Invalid Arguments to MESSAGE_DEVICE_RC_CLEANUP");
-                }
                 break;
 
             case MSG_NATIVE_REQ_GET_FOLDER_ITEMS: {
@@ -1664,6 +1640,12 @@ public final class Avrcp_ext {
                 boolean PlayReq = (msg.arg1 == 1);
                 boolean isRetry = (msg.arg2 == 1);
                 boolean ret;
+                BluetoothDevice prevActiveDevice = mA2dpService.getActiveDevice();
+                if(Objects.equals(dev, prevActiveDevice)) {
+                    isShoActive = false;
+                    Log.w(TAG, dev + " device is already active");
+                    break;
+                }
                 ret = mA2dpService.startSHO(dev);
                 if(!ret) {
                     isShoActive = false;
@@ -1731,8 +1713,10 @@ public final class Avrcp_ext {
                 if (mFastforward)  mFastforward = false;
                 if (mRewind)  mRewind = false;
 
-                Log.w(TAG, "Active device Calling SetBrowsePackage for " + mCachedBrowsePlayer);
-                if (mCachedBrowsePlayer != null && is_player_updated_for_browse == false) {
+                if (mCurrentBrowsingDevice == null && mCachedBrowsePlayer != null &&
+                        is_player_updated_for_browse == false) {
+                    Log.w(TAG, "Calling SetBrowsePackage as part of device switch for "
+                            + mCachedBrowsePlayer);
                     SetBrowsePackage(mCachedBrowsePlayer);
                 }
 
@@ -2259,16 +2243,14 @@ public final class Avrcp_ext {
                 Log.v(TAG,"updateCurrentMediaState: isPlaying = " + isPlaying);
                 // Use A2DP state if we don't have a MediaControlller
                 PlaybackState.Builder builder = new PlaybackState.Builder();
-                if (mMediaController == null || mMediaController.getPlaybackState() == null) {
-                    Log.v(TAG,"updateCurrentMediaState: mMediaController or getPlaybackState() null");
-                    if (isPlaying) {
-                        builder.setState(PlaybackState.STATE_PLAYING,
-                                PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1.0f);
-                    } else {
-                        builder.setState(PlaybackState.STATE_PAUSED,
-                                PlaybackState.PLAYBACK_POSITION_UNKNOWN, 0.0f);
-                    }
+                if (isPlaying) {
+                    builder.setState(PlaybackState.STATE_PLAYING,
+                            PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1.0f);
                 } else {
+                    builder.setState(PlaybackState.STATE_PAUSED,
+                            PlaybackState.PLAYBACK_POSITION_UNKNOWN, 0.0f);
+                }
+                if (mMediaController != null && mMediaController.getPlaybackState() != null) {
                     int mMediaPlayState = mMediaController.getPlaybackState().getState();
                     if (isPlaying) {
                         builder.setState(PlaybackState.STATE_PLAYING,
@@ -2302,7 +2284,7 @@ public final class Avrcp_ext {
                         builder.setState(PlaybackState.STATE_PLAYING,
                                 PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1.0f);
                         newState = builder.build();
-                    } else if (!mAudioManagerIsPlaying && !mAudioManager.isMusicActive()){
+                    } else if (!mAudioManagerIsPlaying) {
                         builder.setState(PlaybackState.STATE_PAUSED,
                                 PlaybackState.PLAYBACK_POSITION_UNKNOWN, 0.0f);
                         newState = builder.build();
@@ -2359,6 +2341,7 @@ public final class Avrcp_ext {
                         playerBrowseWhiteListDB.contains(currPkg))
                         || (prevPkg != null && !prevPkg.isEmpty() &&
                         playerBrowseWhiteListDB.contains(prevPkg))) {
+                    Log.w(TAG, "Send change response as part of player switch");
                     if (deviceFeatures[index].mAvailablePlayersChangedNT ==
                                 AvrcpConstants_ext.NOTIFICATION_TYPE_INTERIM) {
                         registerNotificationRspAvalPlayerChangedNative(
@@ -2820,23 +2803,6 @@ public final class Avrcp_ext {
         return playStatus;
     }
 
-    private boolean isPlayerInBrowseList() {
-        MediaPlayerInfo_ext info = getAddressedPlayerInfo();
-        String pkgName = (info != null) ? info.getPackageName():"";
-        if (pkgName == null || pkgName.isEmpty())
-            return false;
-
-        BrowsedMediaPlayer_ext player =
-                mAvrcpBrowseManager.getBrowsedMediaPlayer(dummyaddr);
-        String browseService = (pkgName != null)?getBrowseServiceName(pkgName):null;
-        if (player == null || browseService == null || browseService.isEmpty())
-            return false;
-
-        boolean isBrowseSupported = player.isPackageInMBSList(pkgName);
-        Log.d(TAG, "Browse supported for pkg " + pkgName + " is " + isBrowseSupported);
-        return isBrowseSupported;
-    }
-
     private boolean isPlayingState(@Nullable PlaybackState state) {
         if (state == null) return false;
         return (state != null) && (state.getState() == PlaybackState.STATE_PLAYING);
@@ -3265,12 +3231,13 @@ public final class Avrcp_ext {
     }
 
     private void SendPlayerSettingMsg(Integer cmd, byte[] address) {
+        long delay_interval = mAvrcpPlayerAppSettings.getPlayerAppSettingsCmdDelay();
         Message msg = mHandler.obtainMessage();
         msg.what = MESSAGE_PLAYERSETTINGS_TIMEOUT;
         msg.arg1 = cmd;
         msg.arg2 = 0;
         msg.obj = Utils.getAddressStringFromByte(address);
-        mHandler.sendMessageDelayed(msg, 500);
+        mHandler.sendMessageDelayed(msg, delay_interval);
     }
 
     private void CreateMusicSettingsAppCmdLookupOrUpdate(Integer cmd,
@@ -3314,7 +3281,6 @@ public final class Avrcp_ext {
 
     private void SetBrowsePackage(String PackageName) {
         String browseService = (PackageName != null)?getBrowseServiceName(PackageName):null;
-        BrowsedMediaPlayer_ext player = mAvrcpBrowseManager.getBrowsedMediaPlayer(dummyaddr);
         Log.w(TAG, "SetBrowsePackage for pkg " + PackageName + "svc" + browseService);
         if (browseService != null && !browseService.isEmpty()) {
             BluetoothDevice browse_active_device = mBrowsingActiveDevice;
@@ -3322,17 +3288,9 @@ public final class Avrcp_ext {
                 is_player_updated_for_browse = true;
                 byte[] addr = getByteAddress(browse_active_device);
                 if (mAvrcpBrowseManager.getBrowsedMediaPlayer(addr) != null) {
-                    Log.w(TAG, "Addr Player update to Browse " + PackageName +
-                            " already req MBS list " + mPkgRequestedMBSConnect);
-                    mCurrentBrowsingDevice = browse_active_device;
                     Log.w(TAG, "Addr Player update to Browse " + PackageName);
                     mAvrcpBrowseManager.getBrowsedMediaPlayer(addr).
                             setCurrentPackage(PackageName, browseService);
-                    if (player != null && !mPkgRequestedMBSConnect.contains(PackageName)) {
-                        Log.w(TAG,"checkMBSConnection try connect");
-                        player.CheckMBSConnection(PackageName, browseService);
-                        mPkgRequestedMBSConnect.add(PackageName);
-                    }
                 }
             } else {
                 Log.w(TAG, "SetBrowsePackage Active device not set yet cache " + PackageName +
@@ -3552,22 +3510,16 @@ public final class Avrcp_ext {
      */
     public void setAvrcpDisconnectedDevice(BluetoothDevice device) {
         Log.i(TAG,"Enter setAvrcpDisconnectedDevice");
+        int deviceIndex = INVALID_DEVICE_INDEX;
         for (int i = 0; i < maxAvrcpConnections; i++ ) {
-            if (deviceFeatures[i].mCurrentDevice !=null && device != null &&
+            if (deviceFeatures[i].mCurrentDevice != null && device != null &&
                     Objects.equals(deviceFeatures[i].mCurrentDevice, device)) {
+                deviceIndex = i;
                 if (deviceFeatures[i].isActiveDevice &&
                       deviceFeatures[i].isAbsoluteVolumeSupportingDevice) {
                     storeVolumeForDevice(device);
                     disconnectedActiveDevice = device;
-                 }
-                // initiate cleanup for all variables;
-                Message msg = mHandler.obtainMessage(MESSAGE_DEVICE_RC_CLEANUP, STACK_CLEANUP,
-                       0, device);
-                mHandler.sendMessage(msg);
-                Log.i(TAG,"Device removed is " + device);
-                Log.i(TAG,"removed at " + i);
-                deviceFeatures[i].mRemoteVolume = -1;
-                deviceFeatures[i].mLocalVolume = -1;
+                }
             }
             if (deviceFeatures[i].mCurrentDevice != null && device != null &&
                     !(Objects.equals(deviceFeatures[i].mCurrentDevice, device))) {
@@ -3580,6 +3532,13 @@ public final class Avrcp_ext {
                     deviceFeatures[i].mTwsPairDisconnected = true;
                 }
             }
+        }
+
+        if (deviceIndex != INVALID_DEVICE_INDEX) {
+            // initiate cleanup for all variables;
+            cleanupDeviceFeaturesIndex(deviceIndex);
+            Log.i(TAG,"Device removed is " + device);
+            Log.i(TAG,"removed at " + deviceIndex);
         }
 
         BATService mBatService = BATService.getBATService();
@@ -3644,6 +3603,26 @@ public final class Avrcp_ext {
                         + packageName);
                 if (packageName != null) {
                     handlePackageModified(packageName, false);
+                }
+            }
+        }
+    }
+
+    private class AvrcpServiceShutDownReceiver extends BroadcastReceiver {
+    @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            BluetoothDevice device = null;
+            if (DEBUG) Log.d(TAG, "AvrcpServiceShutdownReceiver-> Action: " + action);
+            if (action.equals(Intent.ACTION_SHUTDOWN)) {
+                int storeVolume =  mAudioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+                if (DEBUG) Log.d(TAG, "AvrcpServiceShutdownReceiver store volume " + storeVolume);
+                if (mA2dpService != null)
+                   device =  mA2dpService.getActiveDevice();
+                SharedPreferences.Editor pref = getVolumeMap().edit();
+                if (device != null) {
+                    pref.putInt(device.getAddress(), storeVolume);
+                    pref.apply();
                 }
             }
         }
@@ -3789,10 +3768,12 @@ public final class Avrcp_ext {
 
         Log.d(TAG, "Enter setBrowsedPlayer");
         String address = Utils.getAddressStringFromByte(bdaddr);
+        BluetoothDevice prevBrowseDevice = mCurrentBrowsingDevice;
         mCurrentBrowsingDevice = mAdapter.getRemoteDevice(address);
         // checking for error cases
         BluetoothDevice device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(bdaddr);
         if (mBrowsingActiveDevice != null && !Objects.equals(mBrowsingActiveDevice, device)) {
+            mCurrentBrowsingDevice = prevBrowseDevice;
             status = AvrcpConstants_ext.RSP_INTERNAL_ERR;
             Log.w(TAG, "setBrowsedPlayer: Cmd from browse inactive device reject it");
         } else if (mMediaPlayerInfoList.isEmpty()) {
@@ -3887,8 +3868,10 @@ public final class Avrcp_ext {
             updateCurrentMediaState(null);
         }
 
-        Log.w(TAG, "Calling SetBrowsePackage for " + packageName);
-        SetBrowsePackage(packageName);
+        if (mCurrentBrowsingDevice == null) {
+            Log.w(TAG, "Calling SetBrowsePackage as part of player switch for " + packageName);
+            SetBrowsePackage(packageName);
+        }
 
         synchronized (this) {
             synchronized (mMediaPlayerInfoList) {
@@ -3991,27 +3974,21 @@ public final class Avrcp_ext {
         synchronized (this) {
             synchronized (mBrowsePlayerInfoList) {
                 mBrowsePlayerInfoList.clear();
-                BrowsedMediaPlayer_ext player =
-                        mAvrcpBrowseManager.getBrowsedMediaPlayer(dummyaddr);
-                if (player != null)
-                    player.start();
-                Log.d(TAG, "buildBrowsablePlayerList " + player);
+                Log.d(TAG, "buildBrowsablePlayerList ");
                 Intent intent = new Intent(android.service.media.MediaBrowserService.SERVICE_INTERFACE);
                 List<ResolveInfo> playerList =
                         mPackageManager.queryIntentServices(intent, PackageManager.MATCH_ALL);
 
                 for (ResolveInfo info : playerList) {
-                    CharSequence displayName = info.loadLabel(mPackageManager);
-                    String displayableName =
-                            (displayName != null) ? displayName.toString():new String();
                     String serviceName = info.serviceInfo.name;
                     String packageName = info.serviceInfo.packageName;
-                    Log.d(TAG, "svc " + serviceName + " and pkg = " + packageName);
-                    if ((player != null) && (serviceName != null)) {
-                        player.CheckMBSConnection(packageName, serviceName);
-                    }
+                    Log.d(TAG, "Fetch the displayName of package - start");
+                    String displayName = getAppLabel(packageName);
+                    if (displayName == null) displayName = new String();
+                    Log.d(TAG, "Fetch the displayName of package -" + displayName + " end");
+                    Log.d(TAG, "svc " + serviceName + " pkg " + packageName);
                     BrowsePlayerInfo_ext currentPlayer =
-                            new BrowsePlayerInfo_ext(packageName, displayableName, serviceName);
+                            new BrowsePlayerInfo_ext(packageName, displayName, serviceName);
                     mBrowsePlayerInfoList.add(currentPlayer);
                     MediaPlayerInfo_ext playerInfo = getMediaPlayerInfo(packageName);
                     MediaController controller =
@@ -4022,6 +3999,7 @@ public final class Avrcp_ext {
                     } else {
                         addMediaPlayerPackage(packageName);
                     }
+                    Log.d(TAG, "Added MediaPlayerController/MediaPlayerPackage");
                 }
                 updateCurrentMediaState(null);
             }
@@ -4724,6 +4702,8 @@ public final class Avrcp_ext {
         deviceFeatures[index].mLastRemoteVolume = -1;
         deviceFeatures[index].mLastLocalVolume = -1;
         deviceFeatures[index].cache_play_cmd = false;
+        deviceFeatures[index].mRemoteVolume = -1;
+        deviceFeatures[index].mLocalVolume = -1;
     }
 
     private void onConnectionStateChanged(
@@ -4738,6 +4718,11 @@ public final class Avrcp_ext {
         if (br_connected == true) {
             mBrowsingActiveDevice = device;
             Log.w(TAG, "onConnectionStateChanged Set Active browse device" + mBrowsingActiveDevice);
+            if (mCurrentBrowsingDevice == null && mCachedBrowsePlayer != null &&
+                    is_player_updated_for_browse == false) {
+                Log.w(TAG, "Calling SetBrowsePackage as part of connect for "+ mCachedBrowsePlayer);
+                SetBrowsePackage(mCachedBrowsePlayer);
+            }
             return;
         }
         int newState = (rc_connected ? BluetoothProfile.STATE_CONNECTED :
@@ -5267,12 +5252,6 @@ public final class Avrcp_ext {
           return;
         }
 
-        if (mAbsVolThreshold > 0 && mAbsVolThreshold < mAudioStreamMax &&
-           storeVolume > mAbsVolThreshold) {
-            if (DEBUG) Log.v(TAG, "remote store volume too high" + storeVolume + ">" +
-               mAbsVolThreshold);
-            storeVolume = mAbsVolThreshold;
-        }
         if (index == INVALID_DEVICE_INDEX && disconnectedActiveDevice != null &&
             (disconnectedActiveDevice.equals(device)
             || isTwsPlusPair(disconnectedActiveDevice, device))) {
@@ -5936,9 +5915,12 @@ public final class Avrcp_ext {
     }
 
     public static String getImgHandleFromTitle(byte[] bdaddr, String title) {
+        String handle = null;
         if (DEBUG) Log.d(TAG, " getImgHandleFromTitle bdaddr:" + bdaddr + " title:" + title);
-        if (mAvrcpBipRsp != null && title != null)
-            return mAvrcpBipRsp.getImgHandleFromTitle(bdaddr, title);
-        return "";
+        if (mAvrcpBipRsp != null && title != null) {
+            handle = mAvrcpBipRsp.getImgHandleFromTitle(bdaddr, title);
+            return (handle != null && !handle.isEmpty()) ? handle:null;
+        }
+        return handle;
     }
 }
